@@ -169,6 +169,51 @@ Answer based on the context above:"""
         raise Exception(f'LLM request failed: {error_msg}')
 
 
+def get_llm_response_stream(question: str, context: str):
+    """
+    Stream response from OpenAI GPT using RAG context.
+    Yields text chunks as they arrive. Caller can collect for caching.
+    """
+    system = """You are a course assistant. Answer questions based ONLY on the provided context.
+- If the context contains the answer, provide it clearly.
+- If the context doesn't contain relevant information, say "The context does not specify this information."
+- Be concise (max 3 short paragraphs, under 120 words)."""
+    user_content = f"""Context from video transcript:
+{context}
+
+Question: {question}
+
+Answer based on the context above:"""
+    try:
+        client = get_openai_client()
+        stream = client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {'role': 'system', 'content': system},
+                {'role': 'user', 'content': user_content}
+            ],
+            temperature=0.1,
+            max_tokens=150,
+            stream=True,
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0
+        )
+        for chunk in stream:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if getattr(delta, 'content', None):
+                    yield delta.content
+    except Exception as e:
+        error_msg = str(e)
+        if 'Connection' in error_msg or 'timeout' in error_msg.lower():
+            raise Exception(
+                f'Failed to connect to OpenAI API: {error_msg}. '
+                'Check your internet connection and API key validity.'
+            )
+        raise Exception(f'LLM stream failed: {error_msg}')
+
+
 def check_cache(video_id: str, question: str, similarity_threshold: float = 0.90, question_embedding: list | None = None) -> dict | None:
     """
     Check if similar question is cached.
@@ -326,6 +371,68 @@ def ask_ai_service(user, video_id: str, question: str, session_id: int = None) -
     threading.Thread(target=_save_to_cache, daemon=True).start()
 
     return response
+
+
+def ask_ai_service_stream(user, video_id: str, question: str, session_id: int = None):
+    """
+    Generator for streaming Ask AI. Yields dicts for SSE:
+      {"type": "meta", "sources": [...], "cached": bool}
+      {"type": "content", "content": "chunk"}
+      {"type": "done", "answer": "...", "sources": [...]}
+    """
+    normalized_q = question.strip().lower()
+    while normalized_q and normalized_q[-1] in {'?', '!', '.', ','}:
+        normalized_q = normalized_q[:-1].strip()
+
+    if normalized_q in {'hi', 'hello', 'hey', 'hellow'}:
+        yield {'type': 'meta', 'sources': [], 'cached': False}
+        yield {'type': 'content', 'content': 'Hi! Ask me anything about this video and I will answer based on its content.'}
+        yield {'type': 'done', 'answer': 'Hi! Ask me anything about this video and I will answer based on its content.', 'sources': []}
+        return
+
+    question_embedding = generate_embedding(question)
+    cached_response = check_cache(video_id, question, question_embedding=question_embedding)
+
+    if cached_response:
+        yield {'type': 'meta', 'sources': cached_response['sources'], 'cached': True}
+        yield {'type': 'content', 'content': cached_response['answer']}
+        yield {'type': 'done', 'answer': cached_response['answer'], 'sources': cached_response['sources']}
+        return
+
+    relevant_chunks = vector_search(question_embedding, video_id, top_k=2)
+    if not relevant_chunks:
+        yield {'type': 'error', 'message': 'No relevant content found for this question'}
+        return
+
+    context = build_context(relevant_chunks)
+    sources = [
+        {'text': chunk.text, 'timestamp': format_timestamp(chunk.start_time), 'start_time': chunk.start_time, 'end_time': chunk.end_time}
+        for chunk in relevant_chunks
+    ]
+    yield {'type': 'meta', 'sources': sources, 'cached': False}
+
+    full_answer_parts = []
+    for chunk_text in get_llm_response_stream(question, context):
+        full_answer_parts.append(chunk_text)
+        yield {'type': 'content', 'content': chunk_text}
+
+    full_answer = ''.join(full_answer_parts).strip()
+    yield {'type': 'done', 'answer': full_answer, 'sources': sources}
+
+    def _save_to_cache():
+        try:
+            expires_at = datetime.now() + timedelta(days=30)
+            cache_entry = QuestionCache.objects.create(
+                video_id=video_id,
+                question=question,
+                question_embedding=json.dumps(question_embedding),
+                answer=full_answer,
+                expires_at=expires_at,
+            )
+            cache_entry.source_chunks.set(relevant_chunks)
+        except Exception as e:
+            print(f'[v0] Cache save error: {str(e)}')
+    threading.Thread(target=_save_to_cache, daemon=True).start()
 
 
 def ingest_transcript(video_id: str, transcript: str, video_title: str | None = None) -> None:

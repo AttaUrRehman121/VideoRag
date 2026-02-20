@@ -1,3 +1,5 @@
+import json
+from django.http import StreamingHttpResponse
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -99,3 +101,39 @@ class AskAIViewSet(viewsets.ViewSet):
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+    @extend_schema(
+        request=AskAIRequestSerializer,
+        responses={200: {'description': 'SSE stream of events (meta, content, done)'}},
+    )
+    @action(detail=False, methods=['post'], url_path='ask_stream')
+    def ask_stream(self, request):
+        """
+        Ask AI with streaming response (Server-Sent Events).
+        POST same body as /ask/; response is text/event-stream.
+        Events: data: {"type":"meta",...} then data: {"type":"content","content":"..."} then data: {"type":"done",...}
+        """
+        serializer = AskAIRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        def event_stream():
+            from .services import ask_ai_service_stream
+            try:
+                for event in ask_ai_service_stream(
+                    user=request.user,
+                    video_id=serializer.validated_data['video_id'],
+                    question=serializer.validated_data['question'],
+                    session_id=serializer.validated_data.get('session_id'),
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        response = StreamingHttpResponse(
+            event_stream(),
+            content_type='text/event-stream',
+        )
+        response['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response['X-Accel-Buffering'] = 'no'
+        return response
