@@ -77,6 +77,14 @@ DATABASES = {
     }
 }
 
+# Sessions: on Vercel each request can hit a different instance, so DB sessions don't persist.
+# Use signed-cookie sessions so login state is stored in the cookie and works across instances.
+if os.environ.get('VERCEL'):
+    SESSION_ENGINE = 'django.contrib.sessions.backends.signed_cookies'
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    CSRF_COOKIE_SECURE = True
+
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {
