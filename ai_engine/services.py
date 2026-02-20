@@ -14,6 +14,13 @@ from .models import TranscriptChunk, QuestionCache
 from .tasks import split_transcript
 from .utils import calculate_similarity
 
+# Pinecone client (optional, for vector search testing)
+try:
+    from pinecone import Pinecone, ServerlessSpec
+    _pinecone_available = True
+except ImportError:
+    _pinecone_available = False
+
 
 # Initialize OpenAI client lazily to ensure settings are loaded
 def get_openai_client():
@@ -40,6 +47,26 @@ try:
     redis_client = redis.from_url(settings.REDIS_URL)
 except Exception:
     redis_client = None
+
+# Initialize Pinecone client (optional, for vector search testing)
+_pinecone_client = None
+_pinecone_index = None
+def get_pinecone_index():
+    """Get Pinecone index, initializing if needed."""
+    global _pinecone_client, _pinecone_index
+    if not _pinecone_available:
+        raise Exception('Pinecone package not installed. Run: pip install pinecone')
+    if not settings.PINECONE_API_KEY:
+        raise Exception('PINECONE_API_KEY not set in .env file')
+    if not settings.PINECONE_INDEX_NAME:
+        raise Exception('PINECONE_INDEX_NAME not set in .env file')
+    if _pinecone_index is None:
+        try:
+            _pinecone_client = Pinecone(api_key=settings.PINECONE_API_KEY)
+            _pinecone_index = _pinecone_client.Index(settings.PINECONE_INDEX_NAME)
+        except Exception as e:
+            raise Exception(f'Failed to connect to Pinecone: {str(e)}. Check your API key and index name.')
+    return _pinecone_index
 
 
 def generate_embedding(text: str) -> list:
@@ -456,3 +483,234 @@ def ingest_transcript(video_id: str, transcript: str, video_title: str | None = 
             embedding=json.dumps(embedding),
             sequence_number=i,
         )
+
+
+# ========== Pinecone Vector Search Functions ==========
+
+def ingest_transcript_to_pinecone(video_id: str, transcript: str, video_title: str | None = None) -> dict:
+    """
+    Ingest a full transcript directly to Pinecone (not SQLite).
+    Splits transcript, generates embeddings, and upserts to Pinecone with video_id/title in metadata.
+    
+    Returns:
+        dict with status and chunk count
+    """
+    get_pinecone_index()  # Will raise exception if not configured
+    
+    # Split transcript into chunks
+    chunks = split_transcript(transcript, chunk_size=300, chunk_overlap=50)
+    
+    # Generate embeddings for all chunks
+    embeddings = []
+    for chunk in chunks:
+        embedding = generate_embedding(chunk['text'])
+        embeddings.append(embedding)
+    
+    # Upsert to Pinecone
+    pinecone_upsert_chunks(video_id, video_title or '', chunks, embeddings)
+    
+    return {
+        'status': 'ok',
+        'chunks_ingested': len(chunks),
+        'video_id': video_id,
+        'video_title': video_title or '',
+    }
+
+
+def pinecone_upsert_chunks(video_id: str, video_title: str, chunks: list, embeddings: list):
+    """
+    Upsert transcript chunks to Pinecone with video_id and title in metadata.
+    
+    Args:
+        video_id: Video identifier
+        video_title: Video title
+        chunks: List of chunk dicts with 'text', 'start_time', 'end_time', 'sequence_number'
+        embeddings: List of embedding vectors (same length as chunks)
+    """
+    index = get_pinecone_index()
+    
+    vectors = []
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        # split_transcript does not include sequence_number; use loop index.
+        sequence_number = i
+        vector_id = f"{video_id}_{sequence_number}"
+        vectors.append({
+            'id': vector_id,
+            'values': embedding,
+            'metadata': {
+                'video_id': video_id,
+                'video_title': video_title or '',
+                'text': chunk['text'],
+                'start_time': chunk['start_time'],
+                'end_time': chunk['end_time'],
+                'sequence_number': sequence_number,
+            }
+        })
+    
+    # Upsert in batches (Pinecone limit is usually 100 vectors per request)
+    batch_size = 100
+    for i in range(0, len(vectors), batch_size):
+        batch = vectors[i:i + batch_size]
+        index.upsert(vectors=batch)
+
+
+def pinecone_vector_search(question_embedding: list, video_id: str, top_k: int = 3):
+    """
+    Search Pinecone for relevant chunks filtered by video_id.
+    
+    Returns:
+        List of dicts with 'text', 'start_time', 'end_time', 'score', 'metadata'
+    """
+    index = get_pinecone_index()  # Will raise exception if not configured
+    
+    # Query Pinecone with metadata filter for video_id
+    results = index.query(
+        vector=question_embedding,
+        top_k=top_k,
+        include_metadata=True,
+        filter={'video_id': {'$eq': video_id}}
+    )
+    
+    chunks = []
+    for match in results.matches:
+        metadata = match.metadata or {}
+        chunks.append({
+            'text': metadata.get('text', ''),
+            'start_time': metadata.get('start_time', 0),
+            'end_time': metadata.get('end_time', 0),
+            'score': match.score,
+            'metadata': metadata,
+        })
+    
+    return chunks
+
+
+def ask_ai_service_pinecone(user, video_id: str, question: str, session_id: int = None) -> dict:
+    """
+    Ask AI service using Pinecone for vector search with caching for repeated questions.
+    Same flow as ask_ai_service but uses Pinecone instead of SQLite.
+    """
+    import time
+    start_time = time.time()
+    
+    # Fast-path for greetings
+    normalized_q = question.strip().lower()
+    while normalized_q and normalized_q[-1] in {'?', '!', '.', ','}:
+        normalized_q = normalized_q[:-1].strip()
+    if normalized_q in {'hi', 'hello', 'hey', 'hellow'}:
+        return {
+            'answer': 'Hi! Ask me anything about this video and I will answer based on its content.',
+            'sources': [],
+            'cached': False,
+            'session_id': session_id,
+            'message_id': None,
+            'response_time_ms': int((time.time() - start_time) * 1000),
+        }
+    
+    # Generate embedding (needed for both cache check and Pinecone search)
+    embedding_start = time.time()
+    question_embedding = generate_embedding(question)
+    embedding_time = time.time() - embedding_start
+    
+    # Check cache first (reuse embedding to avoid duplicate API call)
+    cache_start = time.time()
+    cached_response = check_cache(video_id, question, question_embedding=question_embedding)
+    cache_time = time.time() - cache_start
+    
+    if cached_response:
+        # Fast path: return cached answer immediately
+        total_time = time.time() - start_time
+        return {
+            'answer': cached_response['answer'],
+            'sources': cached_response['sources'],
+            'cached': True,
+            'session_id': session_id,
+            'message_id': None,
+            'response_time_ms': int(total_time * 1000),
+            'performance': {
+                'embedding_ms': int(embedding_time * 1000),
+                'cache_ms': int(cache_time * 1000),
+                'search_ms': 0,
+                'llm_ms': 0,
+                'total_ms': int(total_time * 1000),
+            }
+        }
+    
+    # Search Pinecone
+    search_start = time.time()
+    relevant_chunks_data = pinecone_vector_search(question_embedding, video_id, top_k=2)
+    search_time = time.time() - search_start
+    
+    if not relevant_chunks_data:
+        raise Exception('No relevant content found for this question in Pinecone')
+    
+    # Build context from Pinecone results
+    context_parts = []
+    for chunk_data in relevant_chunks_data:
+        text = chunk_data['text'].strip()
+        import re
+        text = re.sub(r'\d{2}:\d{2}\s*', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        context_parts.append(text.strip())
+    context = '\n\n---\n\n'.join(context_parts)
+    
+    # Get LLM response
+    llm_start = time.time()
+    answer = get_llm_response(question, context)
+    llm_time = time.time() - llm_start
+    
+    total_time = time.time() - start_time
+    print(f'[PERF-Pinecone] Embedding: {embedding_time:.2f}s, Cache: {cache_time:.2f}s, Search: {search_time:.2f}s, LLM: {llm_time:.2f}s, Total: {total_time:.2f}s')
+    
+    # Format sources
+    sources = [
+        {
+            'text': chunk_data['text'],
+            'timestamp': format_timestamp(chunk_data['start_time']),
+            'start_time': chunk_data['start_time'],
+            'end_time': chunk_data['end_time'],
+            'score': chunk_data.get('score', 0),
+        }
+        for chunk_data in relevant_chunks_data
+    ]
+    
+    response = {
+        'answer': answer,
+        'sources': sources,
+        'cached': False,
+        'session_id': session_id,
+        'message_id': None,
+        'response_time_ms': int(total_time * 1000),
+        'performance': {
+            'embedding_ms': int(embedding_time * 1000),
+            'cache_ms': int(cache_time * 1000),
+            'search_ms': int(search_time * 1000),
+            'llm_ms': int(llm_time * 1000),
+            'total_ms': int(total_time * 1000),
+        }
+    }
+    
+    # Save to cache in background (reuse question_embedding to avoid re-computing)
+    def _save_to_cache():
+        try:
+            # Convert Pinecone chunks to TranscriptChunk-like objects for cache storage
+            # We need to create TranscriptChunk objects or store minimal data
+            # For now, we'll store the answer and question embedding; sources can be reconstructed
+            expires_at = datetime.now() + timedelta(days=30)
+            cache_entry = QuestionCache.objects.create(
+                video_id=video_id,
+                question=question,
+                question_embedding=json.dumps(question_embedding),
+                answer=answer,
+                expires_at=expires_at,
+            )
+            # Note: QuestionCache.source_chunks expects TranscriptChunk objects
+            # Since we're using Pinecone, we can't link to TranscriptChunk directly
+            # The cache will still work for answer lookup, but source_chunks will be empty
+            # This is fine - the answer is what matters for cache hits
+        except Exception as e:
+            print(f'[Pinecone] Cache save error: {str(e)}')
+    
+    threading.Thread(target=_save_to_cache, daemon=True).start()
+    
+    return response

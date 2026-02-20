@@ -67,23 +67,20 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
-# Database - SQLite (Django default, no extra setup)
-# On Vercel, filesystem is read-only except /tmp; use writable path so admin/sessions work
-_db_path = '/tmp/db.sqlite3' if os.environ.get('VERCEL') else BASE_DIR / 'db.sqlite3'
+# Database - Supabase Postgres (no SQLite on Vercel)
+# Uses DB_* credentials from .env (Supabase connection).
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': _db_path,
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', ''),
+        'USER': os.getenv('DB_USER', ''),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'PORT': os.getenv('DB_PORT', '5432'),
+        # Supabase requires SSL; adjust if running against local Postgres.
+        'OPTIONS': {'sslmode': os.getenv('DB_SSLMODE', 'require')},
     }
 }
-
-# Sessions: on Vercel each request can hit a different instance, so DB sessions don't persist.
-# Use signed-cookie sessions so login state is stored in the cookie and works across instances.
-if os.environ.get('VERCEL'):
-    SESSION_ENGINE = 'django.contrib.sessions.backends.signed_cookies'
-    SESSION_COOKIE_SECURE = True
-    SESSION_COOKIE_SAMESITE = 'Lax'
-    CSRF_COOKIE_SECURE = True
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -163,6 +160,11 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 # Use gpt-4o-mini for fastest responses (optimized for speed)
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')
 OPENAI_EMBEDDING_MODEL = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
+
+# Pinecone Configuration (for vector search testing)
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY', '')
+PINECONE_INDEX_NAME = os.getenv('PINECONE_INDEX_NAME', 'video-rag')
+PINECONE_ENVIRONMENT = os.getenv('PINECONE_ENVIRONMENT', '')  # Optional, for older Pinecone accounts
 
 # Logging
 LOGGING = {
