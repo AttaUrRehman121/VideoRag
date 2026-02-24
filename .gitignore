@@ -7,7 +7,7 @@ __v0_jsx-dev-runtime.ts
 __pycache__/
 *.pyc
 *.pyo
-
+venv/
 # Common ignores
 node_modules/
 .next/
